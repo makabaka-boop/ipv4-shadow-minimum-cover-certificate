@@ -70,6 +70,77 @@ function firstMatchIndex(rules: GenRule[], offset: number): number {
   return -1;
 }
 
+function checkCoverageCertificate(
+  rules: GenRule[],
+  ruleIndex: number,
+  report: ReturnType<typeof audit>,
+  label: string,
+): void {
+  const target = rules[ruleIndex]!.cidr;
+  const targetLo = Math.max(target.lo, BASE);
+  const targetHi = Math.min(target.hi, BASE + SUBNET_SIZE - 1);
+  const targetSize = targetHi - targetLo + 1;
+  const targetMask = (1n << BigInt(targetSize)) - 1n;
+  const certificate = report.rules[ruleIndex]!.coverageCertificate;
+
+  expect(certificate, `${label} rule ${ruleIndex} certificate`).not.toBeNull();
+
+  const offsetMask = (ruleIndexInPolicy: number): bigint => {
+    const range = rules[ruleIndexInPolicy]!.cidr;
+    const lo = Math.max(range.lo, targetLo);
+    const hi = Math.min(range.hi, targetHi);
+    if (lo > hi) return 0n;
+    const width = BigInt(hi - lo + 1);
+    const shift = BigInt(lo - targetLo);
+    return (((1n << width) - 1n) << shift) & targetMask;
+  };
+
+  const priorMasks = rules.slice(0, ruleIndex).map((_, j) => offsetMask(j));
+  let minimumRules = ruleIndex + 1;
+  const subsetCount = 2 ** ruleIndex;
+  for (let subset = 1; subset < subsetCount; subset++) {
+    let covered = 0n;
+    let selected = 0;
+    for (let bit = 0; bit < ruleIndex; bit++) {
+      if ((subset & (1 << bit)) !== 0) {
+        covered |= priorMasks[bit]!;
+        selected++;
+      }
+    }
+    if (covered === targetMask) minimumRules = Math.min(minimumRules, selected);
+  }
+
+  expect(certificate!.ruleIds, `${label} rule ${ruleIndex} certificate size`).toHaveLength(
+    minimumRules,
+  );
+  expect(new Set(certificate!.ruleIds).size, `${label} certificate has no duplicate rule`).toBe(
+    certificate!.ruleIds.length,
+  );
+
+  let certificateMask = 0n;
+  let expectedStart = targetLo;
+  for (const step of certificate!.steps) {
+    const priorIndex = rules.findIndex((rule, j) => j < ruleIndex && rule.id === step.ruleId);
+    expect(priorIndex, `${label} certificate rule id must be earlier`).toBeGreaterThanOrEqual(0);
+
+    const start = parseIp(step.startAddress);
+    const end = parseIp(step.endAddress);
+    const prior = rules[priorIndex]!.cidr;
+    expect(start, `${label} certificate step start`).toBe(expectedStart);
+    expect(start, `${label} certificate starts inside target`).toBeGreaterThanOrEqual(targetLo);
+    expect(end, `${label} certificate ends inside target`).toBeLessThanOrEqual(targetHi);
+    expect(start, `${label} step is covered by its selected rule`).toBeGreaterThanOrEqual(prior.lo);
+    expect(end, `${label} step is covered by its selected rule`).toBeLessThanOrEqual(prior.hi);
+
+    const width = BigInt(end - start + 1);
+    certificateMask |= ((1n << width) - 1n) << BigInt(start - targetLo);
+    expectedStart = end + 1;
+  }
+
+  expect(expectedStart, `${label} certificate reaches target end`).toBe(targetHi + 1);
+  expect(certificateMask, `${label} certificate exactly covers target`).toBe(targetMask);
+}
+
 function checkPolicy(rules: GenRule[], label: string, outsideExposed?: number[]): void {
   const input = {
     rules: rules.map((r) => ({ id: r.id, action: r.action, cidr: `${formatIp(r.cidr.base)}/${r.cidr.prefix}` })),
@@ -106,6 +177,11 @@ function checkPolicy(rules: GenRule[], label: string, outsideExposed?: number[])
       expect(r.witness, `${label} rule ${i} witness`).toBe(
         expectedWitness[i] === null ? null : formatIp(BASE + expectedWitness[i]!),
       );
+    }
+    if (r.status === "shadowed" && rules[i]!.cidr.lo >= BASE && rules[i]!.cidr.hi < BASE + SUBNET_SIZE) {
+      checkCoverageCertificate(rules, i, report, label);
+    } else {
+      expect(r.coverageCertificate, `${label} rule ${i} has no certificate`).toBeUndefined();
     }
   });
 
@@ -154,6 +230,10 @@ function checkPolicy(rules: GenRule[], label: string, outsideExposed?: number[])
       witnessIp === null ? null : formatIp(witnessIp),
     );
   }
+
+  // Re-running the same ordered request must produce identical certificates.
+  const rerun = audit(input);
+  expect(rerun, `${label} repeated audit report`).toEqual(report);
 
   // --- queries: first matching rule ---
   report.queries.forEach((q, qi) => {

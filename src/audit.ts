@@ -37,6 +37,25 @@ export interface RuleInput {
   cidr: string;
 }
 
+export interface CoverageCertificateStep {
+  ruleId: string;
+  /** First address this rule adds to the certificate, as an IPv4 address. */
+  startAddress: string;
+  /** Last address this rule adds to the certificate, as an IPv4 address. */
+  endAddress: string;
+}
+
+export interface CoverageCertificate {
+  /** Rule ids selected by the left-to-right greedy proof. */
+  ruleIds: string[];
+  /**
+   * Closed intervals newly contributed at each greedy step. Their union is
+   * exactly the shadowed rule's CIDR, and each interval is covered by its
+   * corresponding earlier rule.
+   */
+  steps: CoverageCertificateStep[];
+}
+
 export interface RuleAudit {
   id: string;
   action: Action;
@@ -49,6 +68,8 @@ export interface RuleAudit {
   /** Smallest address the rule still decides (null when fully shadowed). */
   witness: string | null;
   status: RuleStatus;
+  /** Minimal proof from earlier rules; present only for shadowed rules. */
+  coverageCertificate?: CoverageCertificate;
 }
 
 export interface SwapAudit {
@@ -226,6 +247,56 @@ const statusFor = (
   return "partial";
 };
 
+/**
+ * Build a minimum-size certificate that a target CIDR is covered by earlier
+ * rules. Since the target is one contiguous integer interval, choose at each
+ * uncovered cursor an earlier interval containing it whose right end reaches
+ * farthest; ties keep the earlier rule index. This is the standard interval
+ * stabbing greedy proof, so the number of selected rules is minimum.
+ */
+function coverageCertificate(
+  previousRules: ParsedRule[],
+  target: Cidr,
+): CoverageCertificate {
+  const ruleIds: string[] = [];
+  const steps: CoverageCertificateStep[] = [];
+  let cursor = target.lo;
+
+  while (cursor <= target.hi) {
+    let bestIndex: number | null = null;
+    let bestHi = cursor;
+
+    for (let j = 0; j < previousRules.length; j++) {
+      const range = previousRules[j]!.cidr;
+      if (range.lo > cursor || range.hi < cursor) continue;
+      const candidateHi = Math.min(range.hi, target.hi);
+      if (bestIndex === null || candidateHi > bestHi) {
+        bestIndex = j;
+        bestHi = candidateHi;
+      }
+    }
+
+    // audit() only calls this after proving the target is fully shadowed.
+    if (bestIndex === null) {
+      throw new Error("internal error: incomplete shadowing certificate");
+    }
+
+    const selected = previousRules[bestIndex]!;
+    ruleIds.push(selected.input.id);
+    steps.push({
+      ruleId: selected.input.id,
+      startAddress: formatIp(cursor),
+      endAddress: formatIp(bestHi),
+    });
+
+    // Deliberately no unsigned wrap: after 255.255.255.255 this is 2^32 and
+    // the loop exits, avoiding 255.255.255.255 + 1 wrapping back to zero.
+    cursor = bestHi + 1;
+  }
+
+  return { ruleIds, steps };
+}
+
 /** Run the full audit over parsed input. */
 export function audit(raw: unknown): AuditReport {
   const { rules, queries, rawQueries } = parseRequest(raw);
@@ -242,6 +313,7 @@ export function audit(raw: unknown): AuditReport {
     exposedSets.push(exposed);
     const exposedCount = countAddresses(exposed);
     const witnessIp = minimumAddress(exposed);
+    const status = statusFor(exposed, total);
     covered = addRange(covered, cidrRange(cidr));
 
     return {
@@ -252,7 +324,10 @@ export function audit(raw: unknown): AuditReport {
       exposedAddresses: exposedCount,
       totalAddresses: total,
       witness: witnessIp === null ? null : formatIp(witnessIp),
-      status: statusFor(exposed, total),
+      status,
+      ...(status === "shadowed"
+        ? { coverageCertificate: coverageCertificate(rules.slice(0, i), cidr) }
+        : {}),
     };
   });
 

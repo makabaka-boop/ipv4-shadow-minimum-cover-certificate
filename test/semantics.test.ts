@@ -35,6 +35,14 @@ describe("per-rule residual coverage and status", () => {
     expect(a).toMatchObject({ status: "active", exposedAddresses: 256, witness: "10.0.0.0" });
     expect(b).toMatchObject({ status: "shadowed", exposedAddresses: 0, witness: null });
     expect(c).toMatchObject({ status: "shadowed", exposedAddresses: 0, witness: null });
+    expect(b.coverageCertificate).toEqual({
+      ruleIds: ["a"],
+      steps: [{ ruleId: "a", startAddress: "10.0.0.0", endAddress: "10.0.0.127" }],
+    });
+    expect(c.coverageCertificate).toEqual({
+      ruleIds: ["a"],
+      steps: [{ ruleId: "a", startAddress: "10.0.0.64", endAddress: "10.0.0.127" }],
+    });
   });
 
   it("splits a rule into two exposed fragments around an earlier block", () => {
@@ -63,6 +71,74 @@ describe("per-rule residual coverage and status", () => {
   it("treats equal-action overlap as shadowing for decision purposes too", () => {
     const rep = run([rule("a", "deny", "10.0.0.0/24"), rule("b", "deny", "10.0.0.0/25")]);
     expect(rep.rules[1]).toMatchObject({ status: "shadowed", exposedAddresses: 0 });
+  });
+
+  it("does not attach coverage certificates to active or partial rules", () => {
+    const rep = run([
+      rule("first", "deny", "10.0.0.0/26"),
+      rule("partial", "allow", "10.0.0.0/24"),
+      rule("active", "deny", "10.0.1.0/24"),
+    ]);
+    expect(rep.rules[0]!.coverageCertificate).toBeUndefined();
+    expect(rep.rules[1]!.coverageCertificate).toBeUndefined();
+    expect(rep.rules[2]!.coverageCertificate).toBeUndefined();
+  });
+});
+
+describe("shadowing coverage certificates", () => {
+  it("returns exact closed intervals for a multi-step minimum cover", () => {
+    const rep = run([
+      rule("q0", "deny", "10.0.0.0/26"),
+      rule("q1", "allow", "10.0.0.64/26"),
+      rule("q2", "deny", "10.0.0.128/26"),
+      rule("skip", "allow", "10.0.0.200/30"),
+      rule("q3", "deny", "10.0.0.192/26"),
+      rule("target", "allow", "10.0.0.0/24"),
+    ]);
+
+    expect(rep.rules[5]!.coverageCertificate).toEqual({
+      ruleIds: ["q0", "q1", "q2", "q3"],
+      steps: [
+        { ruleId: "q0", startAddress: "10.0.0.0", endAddress: "10.0.0.63" },
+        { ruleId: "q1", startAddress: "10.0.0.64", endAddress: "10.0.0.127" },
+        { ruleId: "q2", startAddress: "10.0.0.128", endAddress: "10.0.0.191" },
+        { ruleId: "q3", startAddress: "10.0.0.192", endAddress: "10.0.0.255" },
+      ],
+    });
+  });
+
+  it("breaks equal right-end choices using the earlier rule index", () => {
+    const rep = run([
+      rule("wide", "allow", "10.0.0.0/25"),
+      rule("same-reach", "deny", "10.0.0.64/26"),
+      rule("later", "deny", "10.0.0.128/25"),
+      rule("target", "allow", "10.0.0.0/24"),
+    ]);
+
+    expect(rep.rules[3]!.coverageCertificate).toEqual({
+      ruleIds: ["wide", "later"],
+      steps: [
+        { ruleId: "wide", startAddress: "10.0.0.0", endAddress: "10.0.0.127" },
+        { ruleId: "later", startAddress: "10.0.0.128", endAddress: "10.0.0.255" },
+      ],
+    });
+  });
+
+  it("supports /0 boundaries with address-form endpoints and unsigned counts", () => {
+    const rep = run([
+      rule("any", "deny", "0.0.0.0/0"),
+      rule("target", "allow", "0.0.0.0/0"),
+      rule("host", "allow", "8.8.8.8/32"),
+    ]);
+
+    expect(rep.rules[1]!.coverageCertificate).toEqual({
+      ruleIds: ["any"],
+      steps: [{ ruleId: "any", startAddress: "0.0.0.0", endAddress: "255.255.255.255" }],
+    });
+    expect(rep.rules[2]!.coverageCertificate).toEqual({
+      ruleIds: ["any"],
+      steps: [{ ruleId: "any", startAddress: "8.8.8.8", endAddress: "8.8.8.8" }],
+    });
   });
 });
 
