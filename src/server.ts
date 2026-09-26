@@ -8,6 +8,7 @@
  */
 
 import { createServer, type Server } from "node:http";
+import { pathToFileURL } from "node:url";
 import { ValidationError } from "./audit.js";
 import { readBody, runAudit } from "./runtime.js";
 
@@ -52,11 +53,19 @@ export function createPolicyServer(): Server {
   });
 }
 
-const server = createPolicyServer();
-server.listen(PORT, () => {
-  process.stdout.write(`policy service listening on :${PORT}\n`);
-});
+// Listen only when executed directly (`node dist/server.js`); importing
+// createPolicyServer (e.g. from tests) must not bind a port as a side effect.
+const invokedDirectly =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
 
-const shutdown = () => server.close(() => process.exit(0));
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+if (invokedDirectly) {
+  const server = createPolicyServer();
+  server.listen(PORT, () => {
+    process.stdout.write(`policy service listening on :${PORT}\n`);
+  });
+
+  const shutdown = () => server.close(() => process.exit(0));
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+}

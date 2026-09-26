@@ -31,6 +31,30 @@ export type Action = "allow" | "deny";
 
 export type RuleStatus = "active" | "partial" | "shadowed";
 
+export interface CoverageStep {
+  /** Earlier rule selected at this step. */
+  ruleId: string;
+  ruleIndex: number;
+  /**
+   * Closed interval of target addresses newly covered at this step,
+   * dotted-quad, inclusive on both ends.
+   */
+  lo: string;
+  hi: string;
+}
+
+/**
+ * Certificate that the rules before a shadowed rule already cover its whole
+ * CIDR: the selected rule ids plus, per step, the closed interval of target
+ * addresses that step newly covers. The step intervals are disjoint and
+ * their union is exactly the target CIDR.
+ */
+export interface CoverageProof {
+  /** Ids of the selected earlier rules, in selection order. */
+  ruleIds: string[];
+  steps: CoverageStep[];
+}
+
 export interface RuleInput {
   id: string;
   action: Action;
@@ -49,6 +73,11 @@ export interface RuleAudit {
   /** Smallest address the rule still decides (null when fully shadowed). */
   witness: string | null;
   status: RuleStatus;
+  /**
+   * Shadowed rules only: a minimal-count certificate that earlier rules
+   * already cover this whole CIDR. Null for active/partial rules.
+   */
+  coverageProof: CoverageProof | null;
 }
 
 export interface SwapAudit {
@@ -226,6 +255,64 @@ const statusFor = (
   return "partial";
 };
 
+/**
+ * Minimal-count certificate that the rules before a shadowed rule already
+ * cover its entire CIDR.
+ *
+ * Each earlier CIDR is intersected with the target range; the classic
+ * interval-cover greedy then repeatedly takes, among the spans covering the
+ * smallest still-uncovered target address, the one reaching farthest right
+ * (ties go to the earlier rule index). That greedy choice is optimal for
+ * covering a contiguous range, so the number of steps is the smallest
+ * possible. All arithmetic runs on unsigned 32-bit addresses held in
+ * doubles (2^32 stays exact) — no per-address iteration.
+ */
+function buildCoverageProof(
+  rules: ParsedRule[],
+  targetIndex: number,
+): CoverageProof {
+  const target = rules[targetIndex]!.cidr;
+
+  // Intersect every earlier CIDR with the target range.
+  const spans: Array<{ index: number; id: string; lo: number; hi: number }> =
+    [];
+  for (let j = 0; j < targetIndex; j++) {
+    const earlier = rules[j]!;
+    const lo = Math.max(earlier.cidr.lo, target.lo);
+    const hi = Math.min(earlier.cidr.hi, target.hi);
+    if (lo <= hi) spans.push({ index: j, id: earlier.input.id, lo, hi });
+  }
+
+  const ruleIds: string[] = [];
+  const steps: CoverageStep[] = [];
+  let current = target.lo;
+  while (current <= target.hi) {
+    // Spans are scanned in rule order and only a strictly farther right
+    // endpoint replaces the pick, so ties keep the earliest rule index.
+    let best: (typeof spans)[number] | undefined;
+    for (const span of spans) {
+      if (span.lo > current || span.hi < current) continue;
+      if (best === undefined || span.hi > best.hi) best = span;
+    }
+    if (best === undefined) {
+      // Unreachable: the rule was verified shadowed, so earlier rules cover it.
+      throw new Error(
+        `internal error: shadowed rule at index ${targetIndex} not covered by earlier rules`,
+      );
+    }
+    ruleIds.push(best.id);
+    steps.push({
+      ruleId: best.id,
+      ruleIndex: best.index,
+      lo: formatIp(current),
+      hi: formatIp(best.hi),
+    });
+    // May become 2^32 for a target reaching 255.255.255.255; still exact.
+    current = best.hi + 1;
+  }
+  return { ruleIds, steps };
+}
+
 /** Run the full audit over parsed input. */
 export function audit(raw: unknown): AuditReport {
   const { rules, queries, rawQueries } = parseRequest(raw);
@@ -243,6 +330,7 @@ export function audit(raw: unknown): AuditReport {
     const exposedCount = countAddresses(exposed);
     const witnessIp = minimumAddress(exposed);
     covered = addRange(covered, cidrRange(cidr));
+    const status = statusFor(exposed, total);
 
     return {
       id: input.id,
@@ -252,7 +340,9 @@ export function audit(raw: unknown): AuditReport {
       exposedAddresses: exposedCount,
       totalAddresses: total,
       witness: witnessIp === null ? null : formatIp(witnessIp),
-      status: statusFor(exposed, total),
+      status,
+      coverageProof:
+        status === "shadowed" ? buildCoverageProof(rules, i) : null,
     };
   });
 
